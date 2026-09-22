@@ -28,6 +28,8 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -74,7 +76,28 @@ const (
 	platformReleaseName    = "platform"
 
 	distributionStandalone = "Standalone"
+
+	// conversionCheckPageLimit bounds each page of the conversion-health LIST so
+	// the check stays cheap even with many stored MCPServer objects.
+	conversionCheckPageLimit int64 = 500
+
+	// reasonConversionCheckPending is set on MCPLifecycleOperatorAvailable when
+	// the MCPServer CRD / its v1beta1 version is not served yet (transient).
+	reasonConversionCheckPending = "ConversionCheckPending"
+	// reasonConversionCheckFailed is set when listing MCPServers at v1beta1 fails
+	// for any other reason, i.e. the conversion webhook is unhealthy.
+	reasonConversionCheckFailed = "ConversionCheckFailed"
 )
+
+// mcpServerGVR identifies the operand's MCPServer resource at the promoted
+// v1beta1 version. Listing at v1beta1 forces the API server to run the
+// conversion webhook against every stored (v1alpha1) object, so a failing
+// webhook surfaces as a LIST error.
+var mcpServerGVR = schema.GroupVersionResource{
+	Group:    "mcp.x-k8s.io",
+	Version:  "v1beta1",
+	Resource: "mcpservers",
+}
 
 type platformConfig struct {
 	Available           bool
@@ -225,6 +248,19 @@ func (r *MCPLifecycleOperatorReconciler) reconcile(ctx context.Context, cr *v1al
 		return result, nil
 	}
 
+	// Gate the platform-version handshake on conversion health: only advance the
+	// recorded version once stored MCPServer objects are convertible to v1beta1.
+	// Skip the (cluster-wide) MCPServer LIST once the handshake has settled -
+	// i.e. status.distribution already matches the desired platform config - so
+	// steady-state reconciles do not re-run the conversion webhook over every
+	// stored object on each pass. The check re-runs whenever the desired version
+	// moves ahead of the recorded one (the actual upgrade window).
+	if !conversionHandshakeSettled(cr, pc) {
+		if result, healthy := r.checkConversionHealth(ctx, cm); !healthy {
+			return result, nil
+		}
+	}
+
 	cm.MarkTrue(v1alpha1.ConditionMCPLifecycleOperatorAvailable)
 	cm.AggregateReady()
 
@@ -284,6 +320,17 @@ func (r *MCPLifecycleOperatorReconciler) setDistributionStatus(cr *v1alpha1.MCPL
 		Name:    pc.DistributionName,
 		Version: pc.DistributionVersion,
 	}
+}
+
+// conversionHandshakeSettled reports whether the platform-version handshake has
+// already completed for the desired platform config: the config is available
+// and status.distribution already matches it. When settled, the conversion was
+// verified on the reconcile that wrote the distribution, so the gate's
+// cluster-wide MCPServer LIST can be skipped until the desired version changes.
+func conversionHandshakeSettled(cr *v1alpha1.MCPLifecycleOperator, pc platformConfig) bool {
+	return pc.Available &&
+		cr.Status.Distribution.Name == pc.DistributionName &&
+		cr.Status.Distribution.Version == pc.DistributionVersion
 }
 
 func (r *MCPLifecycleOperatorReconciler) handleRemoved(ctx context.Context, cr *v1alpha1.MCPLifecycleOperator, cm *v1alpha1.ConditionsManager) (ctrl.Result, error) {
@@ -372,6 +419,59 @@ func (r *MCPLifecycleOperatorReconciler) checkDeploymentsReady(ctx context.Conte
 			cm.AggregateReady()
 
 			return ctrl.Result{RequeueAfter: defaultRequeueDelay}, false
+		}
+	}
+
+	return ctrl.Result{}, true
+}
+
+// checkConversionHealth verifies that already-stored MCPServer objects are
+// convertible under the promoted v1beta1 API by listing them at v1beta1, which
+// forces the API server to run the conversion webhook for each stored object.
+// It follows the checkDeploymentsReady contract: on a non-healthy outcome it
+// marks MCPLifecycleOperatorAvailable false, aggregates readiness, and returns
+// a requeue result with ready=false so the caller returns (result, nil). A
+// successful list (including an empty one) leaves the condition to the caller's
+// MarkTrue. The list is read-only, spans all namespaces, and is paged so the
+// check stays bounded regardless of how many MCPServers are stored.
+func (r *MCPLifecycleOperatorReconciler) checkConversionHealth(ctx context.Context, cm *v1alpha1.ConditionsManager) (ctrl.Result, bool) {
+	log := logf.FromContext(ctx)
+
+	continueToken := ""
+	for {
+		list, err := r.DynamicClient.Resource(mcpServerGVR).List(ctx, metav1.ListOptions{
+			Limit:    conversionCheckPageLimit,
+			Continue: continueToken,
+		})
+		if err != nil {
+			// The MCPServer CRD or its v1beta1 version may not be served yet
+			// (e.g. early in rollout or before conversion-webhook cert injection
+			// completes). Treat that as a transient pending state, distinct from
+			// a genuine conversion failure.
+			if meta.IsNoMatchError(err) || isNotRegisteredError(err) {
+				log.Info("MCPServer v1beta1 not served yet, deferring platform-version handshake")
+				cm.MarkFalse(v1alpha1.ConditionMCPLifecycleOperatorAvailable,
+					reasonConversionCheckPending,
+					"MCPServer v1beta1 API is not served yet; deferring until the conversion path is ready")
+				cm.AggregateReady()
+
+				return ctrl.Result{RequeueAfter: defaultRequeueDelay}, false
+			}
+
+			// Any other error means the conversion webhook could not convert the
+			// stored objects. Surface the raw error so operators can see the
+			// underlying webhook/cert cause, and hold the platform version back.
+			log.Info("MCPServer conversion check failed, not advancing platform version", "error", err.Error())
+			cm.MarkFalse(v1alpha1.ConditionMCPLifecycleOperatorAvailable,
+				reasonConversionCheckFailed, err.Error())
+			cm.AggregateReady()
+
+			return ctrl.Result{RequeueAfter: defaultRequeueDelay}, false
+		}
+
+		continueToken = list.GetContinue()
+		if continueToken == "" {
+			break
 		}
 	}
 
