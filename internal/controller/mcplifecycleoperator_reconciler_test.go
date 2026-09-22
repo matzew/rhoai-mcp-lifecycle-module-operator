@@ -1214,9 +1214,12 @@ func TestReconcile_ConversionRecovers_RecordsDistribution(t *testing.T) {
 
 func TestReconcile_SteadyState_SkipsConversionLIST(t *testing.T) {
 	cr := newTestCR()
-	// status.distribution already matches the platform config: the handshake has
+	// status.distribution already matches the platform config AND this controller
+	// previously recorded that it verified the conversion: the handshake has
 	// settled, so the conversion gate must not re-LIST MCPServers.
 	cr.Status.Distribution = v1alpha1.Distribution{Name: "SelfManagedRHOAI", Version: "3.5.1"}
+	v1alpha1.NewConditionsManager(cr, cr.Generation).
+		MarkTrueWithReason(v1alpha1.ConditionMCPServerConversionVerified, "ConversionVerified")
 	platformCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      platformConfigName,
@@ -1257,6 +1260,56 @@ func TestReconcile_SteadyState_SkipsConversionLIST(t *testing.T) {
 	c := findCondition(updated, v1alpha1.ConditionMCPLifecycleOperatorAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
 		t.Errorf("Available condition = %+v, want True in steady state", c)
+	}
+}
+
+// TestReconcile_FirstUpgradeAfterRollout_RunsConversionLIST covers the rollout
+// that first introduces this gate: the previous (ungated) controller can
+// advance status.distribution to the desired version before this controller
+// runs, so status.distribution alone would (wrongly) look settled. Because the
+// MCPServerConversionVerified marker is absent, the gate must still run the
+// conversion LIST once, then record the marker.
+func TestReconcile_FirstUpgradeAfterRollout_RunsConversionLIST(t *testing.T) {
+	cr := newTestCR()
+	// Distribution already at the desired version (written by the predecessor),
+	// but NO verified marker: this controller has never checked conversion.
+	cr.Status.Distribution = v1alpha1.Distribution{Name: "SelfManagedRHOAI", Version: "3.5.1"}
+	platformCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformConfigName,
+			Namespace: testPodNamespace,
+		},
+		Data: map[string]string{
+			distributionNameKey:    "SelfManagedRHOAI",
+			distributionVersionKey: "3.5.1",
+		},
+	}
+
+	r := newTestReconcilerFull(&fakeManifestProvider{}, testOperandImage, cr, platformCM)
+	listCalls := 0
+	dyn := newFakeDynamicWithMCPServers()
+	dyn.PrependReactor("list", "mcpservers", func(clienttesting.Action) (bool, runtime.Object, error) {
+		listCalls++
+		return false, nil, nil // fall through to tracker: empty list, healthy
+	})
+	r.DynamicClient = dyn
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if listCalls == 0 {
+		t.Error("expected the conversion LIST to run on the first post-rollout reconcile, got 0 calls")
+	}
+
+	updated := &v1alpha1.MCPLifecycleOperator{}
+	if getErr := r.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); getErr != nil {
+		t.Fatalf("failed to get updated CR: %v", getErr)
+	}
+	c := findCondition(updated, v1alpha1.ConditionMCPServerConversionVerified)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("MCPServerConversionVerified = %+v, want True after the check passes", c)
 	}
 }
 
@@ -1315,46 +1368,63 @@ func TestConversionHandshakeSettled(t *testing.T) {
 		version = "3.5.1"
 	)
 	tests := []struct {
-		name string
-		dist v1alpha1.Distribution
-		pc   platformConfig
-		want bool
+		name     string
+		dist     v1alpha1.Distribution
+		verified bool
+		pc       platformConfig
+		want     bool
 	}{
 		{
-			name: "settled: available and distribution matches",
-			dist: v1alpha1.Distribution{Name: name, Version: version},
-			pc:   platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
-			want: true,
+			name:     "settled: available, distribution matches, and conversion verified",
+			dist:     v1alpha1.Distribution{Name: name, Version: version},
+			verified: true,
+			pc:       platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
+			want:     true,
 		},
 		{
-			name: "not settled: config unavailable",
-			dist: v1alpha1.Distribution{Name: name, Version: version},
-			pc:   platformConfig{Available: false, DistributionName: name, DistributionVersion: version},
-			want: false,
+			name:     "not settled: distribution matches but conversion not yet verified (first rollout)",
+			dist:     v1alpha1.Distribution{Name: name, Version: version},
+			verified: false,
+			pc:       platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
+			want:     false,
 		},
 		{
-			name: "not settled: distribution name mismatch",
-			dist: v1alpha1.Distribution{Name: "ManagedRHOAI", Version: version},
-			pc:   platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
-			want: false,
+			name:     "not settled: config unavailable",
+			dist:     v1alpha1.Distribution{Name: name, Version: version},
+			verified: true,
+			pc:       platformConfig{Available: false, DistributionName: name, DistributionVersion: version},
+			want:     false,
 		},
 		{
-			name: "not settled: distribution version mismatch (upgrade window)",
-			dist: v1alpha1.Distribution{Name: name, Version: "3.5.0"},
-			pc:   platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
-			want: false,
+			name:     "not settled: distribution name mismatch",
+			dist:     v1alpha1.Distribution{Name: "ManagedRHOAI", Version: version},
+			verified: true,
+			pc:       platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
+			want:     false,
 		},
 		{
-			name: "not settled: distribution unset",
-			dist: v1alpha1.Distribution{},
-			pc:   platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
-			want: false,
+			name:     "not settled: distribution version mismatch (upgrade window)",
+			dist:     v1alpha1.Distribution{Name: name, Version: "3.5.0"},
+			verified: true,
+			pc:       platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
+			want:     false,
+		},
+		{
+			name:     "not settled: distribution unset",
+			dist:     v1alpha1.Distribution{},
+			verified: true,
+			pc:       platformConfig{Available: true, DistributionName: name, DistributionVersion: version},
+			want:     false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cr := newTestCR()
 			cr.Status.Distribution = tt.dist
+			if tt.verified {
+				v1alpha1.NewConditionsManager(cr, cr.Generation).
+					MarkTrueWithReason(v1alpha1.ConditionMCPServerConversionVerified, "ConversionVerified")
+			}
 			if got := conversionHandshakeSettled(cr, tt.pc); got != tt.want {
 				t.Errorf("conversionHandshakeSettled() = %v, want %v", got, tt.want)
 			}

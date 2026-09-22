@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
@@ -251,14 +252,23 @@ func (r *MCPLifecycleOperatorReconciler) reconcile(ctx context.Context, cr *v1al
 	// Gate the platform-version handshake on conversion health: only advance the
 	// recorded version once stored MCPServer objects are convertible to v1beta1.
 	// Skip the (cluster-wide) MCPServer LIST once the handshake has settled -
-	// i.e. status.distribution already matches the desired platform config - so
+	// i.e. status.distribution already matches the desired platform config AND
+	// this controller has recorded that it verified the conversion - so
 	// steady-state reconciles do not re-run the conversion webhook over every
 	// stored object on each pass. The check re-runs whenever the desired version
-	// moves ahead of the recorded one (the actual upgrade window).
+	// moves ahead of the recorded one (the actual upgrade window) or when the
+	// verified marker is absent (a freshly rolled-out controller whose
+	// predecessor advanced status.distribution before this gate existed).
 	if !conversionHandshakeSettled(cr, pc) {
 		if result, healthy := r.checkConversionHealth(ctx, cm); !healthy {
 			return result, nil
 		}
+
+		// Record that THIS controller verified conversion for the desired
+		// version. This durable marker is what lets a later steady-state
+		// reconcile skip the LIST; the previous (ungated) controller never sets
+		// it, so it cannot make us skip the first post-upgrade check.
+		cm.MarkTrueWithReason(v1alpha1.ConditionMCPServerConversionVerified, "ConversionVerified")
 	}
 
 	cm.MarkTrue(v1alpha1.ConditionMCPLifecycleOperatorAvailable)
@@ -332,14 +342,20 @@ func (r *MCPLifecycleOperatorReconciler) setDistributionStatus(cr *v1alpha1.MCPL
 }
 
 // conversionHandshakeSettled reports whether the platform-version handshake has
-// already completed for the desired platform config: the config is available
-// and status.distribution already matches it. When settled, the conversion was
-// verified on the reconcile that wrote the distribution, so the gate's
-// cluster-wide MCPServer LIST can be skipped until the desired version changes.
+// already completed for the desired platform config: the config is available,
+// status.distribution already matches it, AND this controller has recorded the
+// MCPServerConversionVerified marker. The marker is required because
+// status.distribution alone is not durable proof that the conversion was
+// checked: during the rollout that first introduces this gate, the previous
+// (ungated) controller can advance status.distribution to the desired version
+// before this controller runs. Requiring the marker - which only this gated
+// controller ever writes, and only after a passing check - forces the freshly
+// rolled-out controller to run the LIST once before it may skip it.
 func conversionHandshakeSettled(cr *v1alpha1.MCPLifecycleOperator, pc platformConfig) bool {
 	return pc.Available &&
 		cr.Status.Distribution.Name == pc.DistributionName &&
-		cr.Status.Distribution.Version == pc.DistributionVersion
+		cr.Status.Distribution.Version == pc.DistributionVersion &&
+		libconditions.IsStatusConditionTrue(cr, v1alpha1.ConditionMCPServerConversionVerified)
 }
 
 func (r *MCPLifecycleOperatorReconciler) handleRemoved(ctx context.Context, cr *v1alpha1.MCPLifecycleOperator, cm *v1alpha1.ConditionsManager) (ctrl.Result, error) {
