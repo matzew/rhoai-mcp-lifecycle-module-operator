@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -121,6 +122,18 @@ func newSVM(conditions ...map[string]interface{}) *unstructured.Unstructured {
 		}
 	}
 
+	return obj
+}
+
+// withStorageMigrationAttempt stamps the attempt annotation this operator uses
+// to bound the delete-and-recreate retry budget onto an SVM.
+func withStorageMigrationAttempt(obj *unstructured.Unstructured, attempt int) *unstructured.Unstructured {
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	ann[storageMigrationAttemptAnnotation] = strconv.Itoa(attempt)
+	obj.SetAnnotations(ann)
 	return obj
 }
 
@@ -304,9 +317,9 @@ func TestReconcileStorageMigration_PendingWhenAPIAbsent(t *testing.T) {
 	}
 }
 
-// C6: the migrator reports Failed=True -> surface Failed carrying its message and
-// delete the terminal migration so the next reconcile recreates it (self-heal).
-func TestReconcileStorageMigration_FailedDeletesForRetry(t *testing.T) {
+// C6: the migrator reports Failed=True -> delete the terminal migration and
+// recreate a fresh one in the same reconcile (self-heal), within the budget.
+func TestReconcileStorageMigration_FailedRecreatesForRetry(t *testing.T) {
 	const msg = "conversion webhook for mcpservers.mcp.x-k8s.io refused connection"
 	dyn := newStorageMigrationDynamicClient(newSVM(svmCondition(svmConditionFailed, "True", msg)))
 	cr := newTestCR()
@@ -318,25 +331,55 @@ func TestReconcileStorageMigration_FailedDeletesForRetry(t *testing.T) {
 	if res.RequeueAfter != storageMigrationRequeueDelay {
 		t.Errorf("expected requeue after %s, got %s", storageMigrationRequeueDelay, res.RequeueAfter)
 	}
-	c := assertMigrationCondition(t, cr, metav1.ConditionFalse, reasonStorageMigrationFailed)
-	if !strings.Contains(c.Message, msg) {
-		t.Errorf("expected the migrator message %q in %q", msg, c.Message)
-	}
+	// The terminal migration is deleted and a fresh one recreated in the same
+	// reconcile, so it is Running again and still present.
 	if got := countStorageMigrationVerb(dyn, "delete"); got != 1 {
 		t.Errorf("expected the failed migration to be deleted once, got %d deletes", got)
 	}
-	if storageMigrationExists(t, dyn) {
-		t.Error("failed migration should have been deleted to allow a retry")
-	}
-
-	// Self-heal: the next reconcile recreates a fresh migration.
-	res = r.reconcileStorageMigration(context.Background(), cr, cm)
-	if res.RequeueAfter != storageMigrationRequeueDelay {
-		t.Errorf("expected requeue after %s on recreate, got %s", storageMigrationRequeueDelay, res.RequeueAfter)
+	if got := countStorageMigrationVerb(dyn, "create"); got != 1 {
+		t.Errorf("expected a fresh migration to be recreated once, got %d creates", got)
 	}
 	assertMigrationCondition(t, cr, metav1.ConditionFalse, reasonStorageMigrationRunning)
 	if !storageMigrationExists(t, dyn) {
 		t.Error("expected a fresh migration to have been recreated")
+	}
+	// The recreated migration carries the incremented attempt so the budget holds.
+	obj, err := dyn.Resource(storageVersionMigrationGVR).Get(context.Background(), storageMigrationName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting recreated migration: %v", err)
+	}
+	if got := storageMigrationAttempt(obj); got != 1 {
+		t.Errorf("expected recreated migration to carry attempt 1, got %d", got)
+	}
+}
+
+// C6 (bound): once the retry budget is spent, a persistently failing migration
+// is left in place and surfaced as needing manual intervention - no more churn.
+func TestReconcileStorageMigration_GivesUpAfterMaxRetries(t *testing.T) {
+	const msg = "conversion webhook permanently unavailable"
+	failed := withStorageMigrationAttempt(newSVM(svmCondition(svmConditionFailed, "True", msg)), maxStorageMigrationRetries)
+	dyn := newStorageMigrationDynamicClient(failed)
+	cr := newTestCR()
+	cm := v1alpha1.NewConditionsManager(cr, cr.Generation)
+
+	r := newStorageMigrationReconciler(dyn, true)
+	res := r.reconcileStorageMigration(context.Background(), cr, cm)
+
+	if res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue once the retry budget is spent, got %s", res.RequeueAfter)
+	}
+	if got := countStorageMigrationVerb(dyn, "delete"); got != 0 {
+		t.Errorf("expected no delete after giving up, got %d", got)
+	}
+	if got := countStorageMigrationVerb(dyn, "create"); got != 0 {
+		t.Errorf("expected no recreate after giving up, got %d", got)
+	}
+	c := assertMigrationCondition(t, cr, metav1.ConditionFalse, reasonStorageMigrationFailed)
+	if !strings.Contains(c.Message, msg) || !strings.Contains(c.Message, "manual intervention") {
+		t.Errorf("expected the migrator message and a manual-intervention note in %q", c.Message)
+	}
+	if !storageMigrationExists(t, dyn) {
+		t.Error("expected the terminal migration to be left in place as evidence")
 	}
 }
 

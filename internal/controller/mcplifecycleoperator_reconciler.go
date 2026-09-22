@@ -297,6 +297,17 @@ func (r *MCPLifecycleOperatorReconciler) handleRemoved(ctx context.Context, cr *
 		return ctrl.Result{RequeueAfter: defaultRequeueDelay}, fmt.Errorf("deleting owned resources: %w", err)
 	}
 
+	// deleteAllOwned garbage-collects by the PlatformPartOf label scoped to the
+	// operand namespace. The StorageVersionMigration is cluster-scoped and not
+	// carrying that label, so it is invisible to that sweep and would linger on
+	// Removed (its ownerReference only fires on CR deletion, not on Removed).
+	// Delete it explicitly.
+	if err := r.deleteStorageMigration(ctx); err != nil && !k8serr.IsNotFound(err) {
+		log.Error(err, "Failed to delete the storage-version migration, will retry on next reconcile")
+
+		return ctrl.Result{RequeueAfter: defaultRequeueDelay}, fmt.Errorf("deleting storage-version migration: %w", err)
+	}
+
 	log.Info("Successfully deleted all owned resources")
 
 	cm.MarkFalse(v1alpha1.ConditionMCPLifecycleOperatorAvailable, "Removed", "MCPLifecycleOperator is in Removed state")

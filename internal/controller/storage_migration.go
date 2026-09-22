@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -60,6 +61,17 @@ const (
 	// is not served, so the condition is actionable rather than a hard failure.
 	storageMigrationPendingMessage = "The migration.k8s.io storage-version migrator API is not available yet; " +
 		"install the storage-version migrator to migrate stored MCPServer objects to v1beta1"
+
+	// storageMigrationAttemptAnnotation records how many times this operator has
+	// created the migration. It is carried on the object and threaded through
+	// each delete-and-recreate so a persistent failure cannot churn forever.
+	storageMigrationAttemptAnnotation = "mcp.x-k8s.io/storage-migration-attempt"
+
+	// maxStorageMigrationRetries bounds the delete-and-recreate cycle. A
+	// permanently broken conversion webhook would otherwise recreate the
+	// migration - and poll discovery - every storageMigrationRequeueDelay
+	// indefinitely. Once the budget is spent we stop and ask for intervention.
+	maxStorageMigrationRetries = 5
 )
 
 // storageVersionMigrationGVR is the cluster-scoped StorageVersionMigration
@@ -107,7 +119,7 @@ func (r *MCPLifecycleOperatorReconciler) reconcileStorageMigration(
 	obj, err := r.DynamicClient.Resource(storageVersionMigrationGVR).Get(ctx, storageMigrationName, metav1.GetOptions{})
 	if err != nil {
 		if k8serr.IsNotFound(err) {
-			return r.createStorageMigration(ctx, cr, cm)
+			return r.createStorageMigration(ctx, cr, cm, 1)
 		}
 
 		// C7: unexpected error - actionable, self-heals on requeue.
@@ -118,7 +130,7 @@ func (r *MCPLifecycleOperatorReconciler) reconcileStorageMigration(
 
 	log.V(1).Info("Observing storage-version migration", "name", storageMigrationName)
 
-	return r.observeStorageMigration(ctx, cm, obj)
+	return r.observeStorageMigration(ctx, cr, cm, obj)
 }
 
 // storageMigrationAPIServed reports whether the cluster serves the
@@ -140,20 +152,26 @@ func (r *MCPLifecycleOperatorReconciler) storageMigrationAPIServed() bool {
 	return false
 }
 
-// createStorageMigration builds and creates the StorageVersionMigration exactly
-// once (C3). It is only reached when the object is absent; it never updates,
-// patches, or re-creates an existing migration. The object is owned by the
+// createStorageMigration builds and creates the StorageVersionMigration. It is
+// reached when the object is absent (attempt 1, C3) and again when a failed
+// migration is recreated to retry (attempt+1); it never updates or patches an
+// existing migration. The attempt number is stamped on the object so the retry
+// budget survives the delete-and-recreate. The object is owned by the
 // cluster-scoped MCPLifecycleOperator CR so it is garbage-collected on uninstall.
 func (r *MCPLifecycleOperatorReconciler) createStorageMigration(
 	ctx context.Context,
 	cr *v1alpha1.MCPLifecycleOperator,
 	cm *v1alpha1.ConditionsManager,
+	attempt int,
 ) ctrl.Result {
 	migration := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": storageVersionMigrationGVR.Group + "/" + storageVersionMigrationGVR.Version,
 		"kind":       "StorageVersionMigration",
 		"metadata": map[string]interface{}{
 			"name": storageMigrationName,
+			"annotations": map[string]interface{}{
+				storageMigrationAttemptAnnotation: strconv.Itoa(attempt),
+			},
 			"labels": map[string]interface{}{
 				"app.kubernetes.io/name":      "mcp-lifecycle-operator",
 				"app.kubernetes.io/component": "storage-version-migration",
@@ -199,12 +217,13 @@ func (r *MCPLifecycleOperatorReconciler) createStorageMigration(
 
 // observeStorageMigration maps the migrator's status.conditions onto our
 // condition: Succeeded=True -> True/Succeeded (C5, no requeue, covers the
-// vacuous zero-object case); Failed=True -> delete the terminal migration so the
-// next reconcile recreates it and self-heals (C6); otherwise still Running (C4).
-// Succeeded is the only branch that asserts the completion signal (no
-// false-complete).
+// vacuous zero-object case); Failed=True -> delete the terminal migration and
+// recreate it to self-heal (C6), up to maxStorageMigrationRetries; otherwise
+// still Running (C4). Succeeded is the only branch that asserts the completion
+// signal (no false-complete).
 func (r *MCPLifecycleOperatorReconciler) observeStorageMigration(
 	ctx context.Context,
+	cr *v1alpha1.MCPLifecycleOperator,
 	cm *v1alpha1.ConditionsManager,
 	obj *unstructured.Unstructured,
 ) ctrl.Result {
@@ -216,11 +235,23 @@ func (r *MCPLifecycleOperatorReconciler) observeStorageMigration(
 
 	if migrationConditionTrue(obj, svmConditionFailed) {
 		msg := migrationConditionMessage(obj, svmConditionFailed)
+		attempt := storageMigrationAttempt(obj)
+
+		// Stop the delete-and-recreate cycle once a persistent failure (e.g. a
+		// permanently broken conversion webhook) has spent the retry budget, so
+		// we neither churn the migration nor poll discovery indefinitely. Leave
+		// the terminal object in place as evidence and return no requeue.
+		if attempt >= maxStorageMigrationRetries {
+			cm.MarkFalse(v1alpha1.ConditionMCPServerStorageMigrated, reasonStorageMigrationFailed,
+				fmt.Sprintf("%s; giving up after %d attempts, manual intervention required", msg, attempt))
+
+			return ctrl.Result{}
+		}
 
 		// A StorageVersionMigration is one-shot and terminal once Failed; the
-		// migrator will not retry it. Delete the object so the next reconcile
-		// recreates a fresh migration, self-healing after a transient failure
-		// (e.g. a conversion-webhook outage) without manual intervention.
+		// migrator will not retry it. Delete the object and recreate a fresh
+		// migration to self-heal after a transient failure (e.g. a conversion-
+		// webhook outage), carrying the incremented attempt so the budget holds.
 		if err := r.deleteStorageMigration(ctx); err != nil && !k8serr.IsNotFound(err) {
 			cm.MarkFalse(v1alpha1.ConditionMCPServerStorageMigrated, reasonStorageMigrationFailed,
 				fmt.Sprintf("%s; failed to delete the migration to retry: %v", msg, err))
@@ -228,10 +259,7 @@ func (r *MCPLifecycleOperatorReconciler) observeStorageMigration(
 			return ctrl.Result{RequeueAfter: storageMigrationRequeueDelay}
 		}
 
-		cm.MarkFalse(v1alpha1.ConditionMCPServerStorageMigrated, reasonStorageMigrationFailed,
-			fmt.Sprintf("%s; recreating the migration to retry", msg))
-
-		return ctrl.Result{RequeueAfter: storageMigrationRequeueDelay}
+		return r.createStorageMigration(ctx, cr, cm, attempt+1)
 	}
 
 	cm.MarkFalse(v1alpha1.ConditionMCPServerStorageMigrated, reasonStorageMigrationRunning,
@@ -245,6 +273,23 @@ func (r *MCPLifecycleOperatorReconciler) observeStorageMigration(
 func (r *MCPLifecycleOperatorReconciler) deleteStorageMigration(ctx context.Context) error {
 	return r.DynamicClient.Resource(storageVersionMigrationGVR).
 		Delete(ctx, storageMigrationName, metav1.DeleteOptions{})
+}
+
+// storageMigrationAttempt reads the attempt counter this operator stamped on the
+// migration. A migration created outside this operator (or by an older version)
+// carries no annotation and reads as 0, so it gets the full retry budget.
+func storageMigrationAttempt(obj *unstructured.Unstructured) int {
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		return 0
+	}
+
+	n, err := strconv.Atoi(ann[storageMigrationAttemptAnnotation])
+	if err != nil {
+		return 0
+	}
+
+	return n
 }
 
 // storageMigrationSettled reports whether the MCPServerStorageMigrated condition
