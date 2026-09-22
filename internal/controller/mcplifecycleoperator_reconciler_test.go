@@ -583,7 +583,14 @@ func TestCheckDeploymentsReady_NilReplicas(t *testing.T) {
 	}
 }
 
-func TestReconcile_StatusPatch_SetsReleaseInfo(t *testing.T) {
+// TestReconcile_StatusPatch_ReleasesPlatformHeldBackOnFailure asserts that a
+// failed reconcile still records the module's own release but does NOT advance
+// status.releases.platform - the field the platform operator reads to track
+// upgrade completion. The platform release is derived from status.distribution
+// (the gated, committed value), which setDistributionStatus leaves untouched on
+// a failed reconcile, so it advances only in lockstep with the conversion-health
+// handshake.
+func TestReconcile_StatusPatch_ReleasesPlatformHeldBackOnFailure(t *testing.T) {
 	cr := newTestCR()
 	platformCM := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -616,13 +623,13 @@ func TestReconcile_StatusPatch_SetsReleaseInfo(t *testing.T) {
 	}
 
 	releases := updated.Status.ComponentReleaseStatus.Releases
-	if len(releases) != 2 {
-		t.Fatalf("expected 2 releases, got %d", len(releases))
+	if len(releases) != 1 {
+		t.Fatalf("expected 1 release (module only, platform held back), got %d: %+v", len(releases), releases)
 	}
 
 	releasesByName := make(map[string]platformcommon.ComponentRelease, len(releases))
-	for _, r := range releases {
-		releasesByName[r.Name] = r
+	for _, rel := range releases {
+		releasesByName[rel.Name] = rel
 	}
 
 	moduleRelease, ok := releasesByName[v1alpha1.MCPLifecycleOperatorServiceName]
@@ -633,12 +640,8 @@ func TestReconcile_StatusPatch_SetsReleaseInfo(t *testing.T) {
 		t.Errorf("module release version = %q, want %q", moduleRelease.Version, testOperatorVersion)
 	}
 
-	platformRelease, ok := releasesByName[platformReleaseName]
-	if !ok {
-		t.Fatal("missing platform release entry")
-	}
-	if platformRelease.Version != "2.20.0" {
-		t.Errorf("platform release version = %q, want %q", platformRelease.Version, "2.20.0")
+	if _, ok := releasesByName[platformReleaseName]; ok {
+		t.Errorf("platform release entry present on failed reconcile, want it held back until the handshake commits status.distribution")
 	}
 }
 
@@ -664,9 +667,60 @@ func TestReconcile_StatusPatch_NoPlatformConfigMap(t *testing.T) {
 		t.Fatalf("failed to get updated CR: %v", getErr)
 	}
 
+	// The platform release is gated on status.distribution, which a failed
+	// reconcile never advances, so only the module's own release is recorded.
 	releases := updated.Status.ComponentReleaseStatus.Releases
-	if len(releases) != 2 {
-		t.Fatalf("expected 2 releases (module + platform with operator version), got %d", len(releases))
+	if len(releases) != 1 {
+		t.Fatalf("expected 1 release (module only, platform held back), got %d: %+v", len(releases), releases)
+	}
+}
+
+// TestReconcile_StatusPatch_ReleasesPlatformSetOnSuccess asserts the positive
+// side of the gate: after a fully successful reconcile the committed platform
+// version is published to status.releases.platform, matching status.distribution.
+func TestReconcile_StatusPatch_ReleasesPlatformSetOnSuccess(t *testing.T) {
+	cr := newTestCR()
+	platformCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformConfigName,
+			Namespace: testPodNamespace,
+		},
+		Data: map[string]string{
+			distributionNameKey:    "SelfManagedRHOAI",
+			distributionVersionKey: "3.5.1",
+		},
+	}
+
+	r := newTestReconcilerFull(&fakeManifestProvider{}, testOperandImage, cr, platformCM)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	updated := &v1alpha1.MCPLifecycleOperator{}
+	if getErr := r.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); getErr != nil {
+		t.Fatalf("failed to get updated CR: %v", getErr)
+	}
+
+	releases := updated.Status.ComponentReleaseStatus.Releases
+	releasesByName := make(map[string]platformcommon.ComponentRelease, len(releases))
+	for _, rel := range releases {
+		releasesByName[rel.Name] = rel
+	}
+
+	platformRelease, ok := releasesByName[platformReleaseName]
+	if !ok {
+		t.Fatalf("missing platform release entry after successful reconcile, got %+v", releases)
+	}
+	if platformRelease.Version != "3.5.1" {
+		t.Errorf("platform release version = %q, want %q", platformRelease.Version, "3.5.1")
+	}
+	if platformRelease.Version != updated.Status.Distribution.Version {
+		t.Errorf("platform release version %q != committed distribution version %q (must advance in lockstep)",
+			platformRelease.Version, updated.Status.Distribution.Version)
 	}
 }
 
@@ -849,6 +903,13 @@ func TestReconcile_RequeueDelay(t *testing.T) {
 	}
 }
 
+// TestReconcile_PlatformVersionUpdate exercises the upgrade window: when the
+// platform ConfigMap advances the desired version, a successful reconcile
+// advances status.releases.platform in lockstep with the committed
+// status.distribution. Both reconciles run the full success path (the
+// conversion-health gate passes over an empty MCPServer list) so the platform
+// release moves only once the handshake has committed - the field the platform
+// operator reads to track upgrade completion.
 func TestReconcile_PlatformVersionUpdate(t *testing.T) {
 	cr := newTestCR()
 	platformCM := &corev1.ConfigMap{
@@ -860,47 +921,46 @@ func TestReconcile_PlatformVersionUpdate(t *testing.T) {
 			platformVersionKey: "2.20.0",
 		},
 	}
-	cli := fake.NewClientBuilder().
-		WithScheme(testScheme).
-		WithObjects(cr, platformCM).
-		WithStatusSubresource(cr).
-		Build()
 
-	r := newTestReconciler(cli, &fakeManifestProvider{err: fmt.Errorf("stop early")}, testOperandImage)
+	r := newTestReconcilerFull(&fakeManifestProvider{}, testOperandImage, cr, platformCM)
 
-	_, _ = r.Reconcile(context.Background(), ctrl.Request{
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName},
-	})
+	}); err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
 
 	updated := &v1alpha1.MCPLifecycleOperator{}
-	if err := cli.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); err != nil {
+	if err := r.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); err != nil {
 		t.Fatalf("failed to get updated CR: %v", err)
 	}
 
 	releasesByName := make(map[string]platformcommon.ComponentRelease)
-	for _, r := range updated.Status.ComponentReleaseStatus.Releases {
-		releasesByName[r.Name] = r
+	for _, rel := range updated.Status.ComponentReleaseStatus.Releases {
+		releasesByName[rel.Name] = rel
 	}
 	if v := releasesByName[platformReleaseName].Version; v != "2.20.0" {
 		t.Fatalf("initial platform version = %q, want %q", v, "2.20.0")
 	}
 
 	platformCM.Data[platformVersionKey] = "2.21.0"
-	if err := cli.Update(context.Background(), platformCM); err != nil {
+	if err := r.Update(context.Background(), platformCM); err != nil {
 		t.Fatalf("failed to update ConfigMap: %v", err)
 	}
 
-	_, _ = r.Reconcile(context.Background(), ctrl.Request{
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName},
-	})
+	}); err != nil {
+		t.Fatalf("unexpected error on reconcile after ConfigMap change: %v", err)
+	}
 
-	if err := cli.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); err != nil {
+	if err := r.Get(context.Background(), types.NamespacedName{Name: v1alpha1.MCPLifecycleOperatorInstanceName}, updated); err != nil {
 		t.Fatalf("failed to get updated CR after ConfigMap change: %v", err)
 	}
 
 	releasesByName = make(map[string]platformcommon.ComponentRelease)
-	for _, r := range updated.Status.ComponentReleaseStatus.Releases {
-		releasesByName[r.Name] = r
+	for _, rel := range updated.Status.ComponentReleaseStatus.Releases {
+		releasesByName[rel.Name] = rel
 	}
 	if v := releasesByName[platformReleaseName].Version; v != "2.21.0" {
 		t.Errorf("platform version after ConfigMap update = %q, want %q", v, "2.21.0")

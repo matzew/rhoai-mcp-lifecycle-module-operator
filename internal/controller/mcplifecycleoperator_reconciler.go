@@ -286,23 +286,32 @@ func (r *MCPLifecycleOperatorReconciler) updateBaseStatus(cr *v1alpha1.MCPLifecy
 	cr.Status.Status.Phase = cm.Phase()
 
 	if pc.Available {
-		r.setReleases(cr, pc)
+		r.setReleases(cr)
 	}
 }
 
 // setReleases populates the status.releases array with the module's own
-// release and, when available, the platform distribution version.
-func (r *MCPLifecycleOperatorReconciler) setReleases(cr *v1alpha1.MCPLifecycleOperator, pc platformConfig) {
+// release and, once committed, the platform distribution version.
+//
+// The platform release version is taken from status.distribution (the gated,
+// committed value) rather than the desired platform config, so
+// status.releases.platform - the field the platform operator reads to track
+// upgrade completion - only advances once the conversion-health handshake has
+// passed, in lockstep with status.distribution. On a pending or failed
+// reconcile the previously committed version is preserved (not advanced, not
+// wiped), because setDistributionStatus leaves status.distribution untouched
+// and this deferred call runs after it.
+func (r *MCPLifecycleOperatorReconciler) setReleases(cr *v1alpha1.MCPLifecycleOperator) {
 	releases := []platformcommon.ComponentRelease{{
 		Name:    v1alpha1.MCPLifecycleOperatorServiceName,
 		RepoURL: "https://github.com/opendatahub-io/mcp-lifecycle-module-operator",
 		Version: r.OperatorVersion,
 	}}
 
-	if pc.DistributionVersion != "" {
+	if v := cr.Status.Distribution.Version; v != "" {
 		releases = append(releases, platformcommon.ComponentRelease{
 			Name:    platformReleaseName,
-			Version: pc.DistributionVersion,
+			Version: v,
 		})
 	}
 
