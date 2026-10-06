@@ -72,6 +72,7 @@ func (p *KustomizeProvider) Manifests(_ context.Context, params Params) ([]unstr
 		rewriteCertManagerNamespace(DefaultOperandNamespace, targetNS),
 		replaceImage(params.OperandImage),
 		injectTLSEnvVars(params.TLSMinVersion, params.TLSCipherSuites, params.TLSGroups),
+		injectNetworkPolicyPostureArg(networkPolicyRestrictedPosture),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("transforming manifests: %w", err)
@@ -245,6 +246,77 @@ func setEnvVar(envSlice []interface{}, name, value string) []interface{} {
 		"name":  name,
 		"value": value,
 	})
+}
+
+const (
+	networkPolicyPostureFlag       = "--network-policy-default-posture"
+	networkPolicyRestrictedPosture = "restricted"
+)
+
+// injectNetworkPolicyPostureArg sets the operand controller-manager's
+// --network-policy-default-posture flag so the operator applies the given
+// default NetworkPolicy posture to the workloads it manages. On ODH/RHOAI the
+// platform contract (ODH-ADR-Operator-0016) calls for a least-privilege,
+// deny-by-default ingress posture, so the module operator flips the operand's
+// own default (which stays "open" upstream) to "restricted".
+//
+// Unlike the TLS settings, the upstream flag is not environment-backed, so it
+// must be supplied as a container argument rather than an env var. An empty
+// posture leaves the operand's own default untouched.
+func injectNetworkPolicyPostureArg(posture string) manifestival.Transformer {
+	return func(u *unstructured.Unstructured) error {
+		if posture == "" {
+			return nil
+		}
+		if u.GetKind() != "Deployment" {
+			return nil
+		}
+
+		containers, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found {
+			return nil
+		}
+
+		injected := false
+		for i, c := range containers {
+			container, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if name, _, _ := unstructured.NestedString(container, "name"); name != "manager" {
+				continue
+			}
+
+			args, _, _ := unstructured.NestedStringSlice(container, "args")
+			args = setFlagArg(args, networkPolicyPostureFlag, posture)
+			if err := unstructured.SetNestedStringSlice(container, args, "args"); err != nil {
+				return fmt.Errorf("deployment %q: setting network policy posture arg: %w", u.GetName(), err)
+			}
+			containers[i] = container
+			injected = true
+		}
+
+		if !injected {
+			return fmt.Errorf("deployment %q has no container named %q to set the network policy posture arg",
+				u.GetName(), "manager")
+		}
+
+		return unstructured.SetNestedSlice(u.Object, containers, "spec", "template", "spec", "containers")
+	}
+}
+
+// setFlagArg replaces an existing "flag=value" (or bare "flag") entry in args
+// with "flag=value", or appends it when absent, so repeated reconciles are
+// idempotent and never duplicate the flag.
+func setFlagArg(args []string, flag, value string) []string {
+	want := flag + "=" + value
+	for i, a := range args {
+		if a == flag || strings.HasPrefix(a, flag+"=") {
+			args[i] = want
+			return args
+		}
+	}
+	return append(args, want)
 }
 
 func replaceImage(newImage string) manifestival.Transformer {
