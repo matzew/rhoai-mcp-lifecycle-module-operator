@@ -183,30 +183,53 @@ const (
 	envPropagateTLS    = "PROPAGATE_TLS_ENV_VARS"
 )
 
+// withManagerContainer runs fn against the "manager" container of a Deployment's
+// pod template and writes the mutated container back. It is a no-op for
+// non-Deployment resources and returns an error when the Deployment has no
+// containers or no "manager" container, so every transformer that patches the
+// manager container shares one consistent traversal and edge-case handling.
+func withManagerContainer(u *unstructured.Unstructured, fn func(container map[string]interface{}) error) error {
+	if u.GetKind() != "Deployment" {
+		return nil
+	}
+
+	containers, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return fmt.Errorf("deployment %q: reading containers: %w", u.GetName(), err)
+	}
+	if !found {
+		return fmt.Errorf("deployment %q is missing spec.template.spec.containers", u.GetName())
+	}
+
+	handled := false
+	for i, c := range containers {
+		container, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if name, _, _ := unstructured.NestedString(container, "name"); name != "manager" {
+			continue
+		}
+		if err := fn(container); err != nil {
+			return err
+		}
+		containers[i] = container
+		handled = true
+	}
+
+	if !handled {
+		return fmt.Errorf("deployment %q has no container named %q", u.GetName(), "manager")
+	}
+
+	return unstructured.SetNestedSlice(u.Object, containers, "spec", "template", "spec", "containers")
+}
+
 func injectTLSEnvVars(minVersion, cipherSuites, groups string) manifestival.Transformer {
 	return func(u *unstructured.Unstructured) error {
 		if minVersion == "" && cipherSuites == "" && groups == "" {
 			return nil
 		}
-		if u.GetKind() != "Deployment" {
-			return nil
-		}
-
-		containers, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
-		if err != nil || !found {
-			return nil
-		}
-
-		injected := false
-		for i, c := range containers {
-			container, ok := c.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if name, _, _ := unstructured.NestedString(container, "name"); name != "manager" {
-				continue
-			}
-
+		return withManagerContainer(u, func(container map[string]interface{}) error {
 			envSlice, _, _ := unstructured.NestedSlice(container, "env")
 			envSlice = setEnvVar(envSlice, envTLSMinVersion, minVersion)
 			envSlice = setEnvVar(envSlice, envTLSCipherSuites, cipherSuites)
@@ -216,15 +239,8 @@ func injectTLSEnvVars(minVersion, cipherSuites, groups string) manifestival.Tran
 			if err := unstructured.SetNestedSlice(container, envSlice, "env"); err != nil {
 				return fmt.Errorf("deployment %q: setting TLS env vars: %w", u.GetName(), err)
 			}
-			containers[i] = container
-			injected = true
-		}
-
-		if !injected {
-			return fmt.Errorf("deployment %q has no container named %q to inject TLS env vars", u.GetName(), "manager")
-		}
-
-		return unstructured.SetNestedSlice(u.Object, containers, "spec", "template", "spec", "containers")
+			return nil
+		})
 	}
 }
 
@@ -268,40 +284,17 @@ func injectNetworkPolicyPostureArg(posture string) manifestival.Transformer {
 		if posture == "" {
 			return nil
 		}
-		if u.GetKind() != "Deployment" {
-			return nil
-		}
-
-		containers, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
-		if err != nil || !found {
-			return nil
-		}
-
-		injected := false
-		for i, c := range containers {
-			container, ok := c.(map[string]interface{})
-			if !ok {
-				continue
+		return withManagerContainer(u, func(container map[string]interface{}) error {
+			args, _, err := unstructured.NestedStringSlice(container, "args")
+			if err != nil {
+				return fmt.Errorf("deployment %q: reading args: %w", u.GetName(), err)
 			}
-			if name, _, _ := unstructured.NestedString(container, "name"); name != "manager" {
-				continue
-			}
-
-			args, _, _ := unstructured.NestedStringSlice(container, "args")
 			args = setFlagArg(args, networkPolicyPostureFlag, posture)
 			if err := unstructured.SetNestedStringSlice(container, args, "args"); err != nil {
 				return fmt.Errorf("deployment %q: setting network policy posture arg: %w", u.GetName(), err)
 			}
-			containers[i] = container
-			injected = true
-		}
-
-		if !injected {
-			return fmt.Errorf("deployment %q has no container named %q to set the network policy posture arg",
-				u.GetName(), "manager")
-		}
-
-		return unstructured.SetNestedSlice(u.Object, containers, "spec", "template", "spec", "containers")
+			return nil
+		})
 	}
 }
 
@@ -321,35 +314,12 @@ func setFlagArg(args []string, flag, value string) []string {
 
 func replaceImage(newImage string) manifestival.Transformer {
 	return func(u *unstructured.Unstructured) error {
-		if newImage == "" || u.GetKind() != "Deployment" {
+		if newImage == "" {
 			return nil
 		}
-
-		containers, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
-		if err != nil {
-			return fmt.Errorf("deployment %q: reading containers: %w", u.GetName(), err)
-		}
-		if !found {
-			return fmt.Errorf("deployment %q is missing spec.template.spec.containers", u.GetName())
-		}
-
-		replaced := false
-		for i, c := range containers {
-			container, ok := c.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if name, _, _ := unstructured.NestedString(container, "name"); name == "manager" {
-				container["image"] = newImage
-				containers[i] = container
-				replaced = true
-			}
-		}
-
-		if !replaced {
-			return fmt.Errorf("deployment %q has no container named %q to replace image", u.GetName(), "manager")
-		}
-
-		return unstructured.SetNestedSlice(u.Object, containers, "spec", "template", "spec", "containers")
+		return withManagerContainer(u, func(container map[string]interface{}) error {
+			container["image"] = newImage
+			return nil
+		})
 	}
 }

@@ -548,7 +548,10 @@ func managerArgs(t *testing.T, resources []unstructured.Unstructured) []string {
 		}
 		containers, _, _ := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
 		for _, c := range containers {
-			container := c.(map[string]interface{})
+			container, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
 			if container["name"] != "manager" {
 				continue
 			}
