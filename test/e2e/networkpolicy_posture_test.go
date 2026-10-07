@@ -74,6 +74,20 @@ var _ = Describe("Restricted operand NetworkPolicy posture", func() {
 			Fail("failed to delete MCPServer: " + err.Error())
 		}
 
+		// Both specs reuse the same MCPServer name and Ginkgo randomizes spec
+		// order, so the delete above must fully complete before the next spec's
+		// Create runs; otherwise the Create races a still-terminating server
+		// (e.g. finalizers held while the operand tears down) and fails with
+		// AlreadyExists. Poll until the MCPServer is gone to keep the suite
+		// order-independent.
+		Eventually(func() bool {
+			return k8serr.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: operandNamespace,
+				Name:      mcpServerName,
+			}, newMCPServer(mcpServerName, nil)))
+		}, timeout, interval).Should(BeTrue(),
+			"MCPServer %q still present after delete", mcpServerName)
+
 		cr := &v1alpha1.MCPLifecycleOperator{
 			ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.MCPLifecycleOperatorInstanceName},
 		}
