@@ -50,6 +50,12 @@ import (
 
 var (
 	scheme = runtime.NewScheme()
+
+	// stripManagedFields removes managed fields before an object is committed to
+	// the cache. It is reused by stripCRDSchema because a per-object Transform
+	// overrides the cache's DefaultTransform, so CRDs would otherwise lose the
+	// managed-field stripping applied to every other cached type.
+	stripManagedFields = cache.TransformStripManagedFields()
 )
 
 func init() {
@@ -60,6 +66,32 @@ func init() {
 	utilruntime.Must(rbacv1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
 	utilruntime.Must(configv1.Install(scheme))
+}
+
+// stripCRDSchema is a cache transform for CustomResourceDefinitions. The
+// controller only reads a CRD's metadata.name (to detect the gateway CRDs and
+// trigger watch registration), so the per-version OpenAPI v3 schema - by far the
+// largest part of a CRD - is dropped before the object is committed to the
+// cache. This keeps every CRD watchable (the gateway CRDs carry no managed-by
+// label, so the CRD cache cannot be label-filtered) while avoiding holding every
+// cluster CRD's full schema in memory. Managed fields are stripped as well,
+// because a per-object Transform overrides the cache's DefaultTransform.
+func stripCRDSchema(obj interface{}) (interface{}, error) {
+	obj, err := stripManagedFields(obj)
+	if err != nil {
+		return obj, err
+	}
+
+	crd, ok := obj.(*extv1.CustomResourceDefinition)
+	if !ok {
+		return obj, nil
+	}
+
+	for i := range crd.Spec.Versions {
+		crd.Spec.Versions[i].Schema = nil
+	}
+
+	return crd, nil
 }
 
 func main() {
@@ -82,9 +114,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Cluster-scoped resources (ClusterRole, ClusterRoleBinding, CRD) cannot be
+	// Cluster-scoped resources (ClusterRole, ClusterRoleBinding) cannot be
 	// namespace-scoped, so we filter by the managed-resource label to avoid
-	// caching every such object in the cluster.
+	// caching every such object in the cluster. CRDs are handled differently
+	// (see the ByObject entry below): the gateway CRDs we watch carry no
+	// managed-by label, so the CRD cache cannot be label-filtered and instead
+	// strips each CRD's bulky schema to keep memory down.
 	managedSelector := labels.SelectorFromSet(labels.Set{
 		odhLabels.PlatformPartOf: v1alpha1.MCPLifecycleOperatorServiceName,
 	})
@@ -104,7 +139,7 @@ func main() {
 				&v1alpha1.MCPLifecycleOperator{}:  {},
 				&rbacv1.ClusterRole{}:             {Label: managedSelector},
 				&rbacv1.ClusterRoleBinding{}:      {Label: managedSelector},
-				&extv1.CustomResourceDefinition{}: {},
+				&extv1.CustomResourceDefinition{}: {Transform: stripCRDSchema},
 			},
 		},
 	})
