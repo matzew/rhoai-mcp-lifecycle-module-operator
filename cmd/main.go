@@ -76,6 +76,11 @@ func init() {
 // label, so the CRD cache cannot be label-filtered) while avoiding holding every
 // cluster CRD's full schema in memory. Managed fields are stripped as well,
 // because a per-object Transform overrides the cache's DefaultTransform.
+//
+// Caution: because this mutates the cached copy, a cached CRD read (r.Get on a
+// CustomResourceDefinition) returns a nil Spec.Versions[].Schema. Any future
+// code that needs a CRD's schema, conversion, or served/storage version detail
+// must read it uncached (e.g. via the API reader), not through the client cache.
 func stripCRDSchema(obj interface{}) (interface{}, error) {
 	obj, err := stripManagedFields(obj)
 	if err != nil {
@@ -134,7 +139,7 @@ func main() {
 			DefaultNamespaces: map[string]cache.Config{
 				podNamespace: {},
 			},
-			DefaultTransform: cache.TransformStripManagedFields(),
+			DefaultTransform: stripManagedFields,
 			ByObject: map[client.Object]cache.ByObject{
 				&v1alpha1.MCPLifecycleOperator{}:  {},
 				&rbacv1.ClusterRole{}:             {Label: managedSelector},
