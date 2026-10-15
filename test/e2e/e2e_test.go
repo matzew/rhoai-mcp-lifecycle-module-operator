@@ -183,16 +183,36 @@ var _ = Describe("MCPLifecycleOperator", func() {
 		}, timeout, interval).Should(Succeed())
 	})
 
-	It("should keep namespace and module operator when CR is deleted", func() {
+	It("should garbage-collect the operand but keep namespace and module operator when CR is deleted", func() {
 		createManagedCR(ctx)
 		waitForOperandReady(ctx)
 
+		By("Fetching the CR so its UID can anchor the ownerReference assertion")
+		cr := &v1alpha1.MCPLifecycleOperator{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: v1alpha1.MCPLifecycleOperatorInstanceName,
+		}, cr)).To(Succeed())
+
+		By("Verifying the operand deployment carries a controller ownerReference to the CR")
+		// The cluster-scoped CR legitimately owns the namespaced operand
+		// Deployment; this controller ownerReference is what lets
+		// kube-controller-manager garbage-collect the operand when the CR is
+		// deleted. Poll, matching the convention of the other operand checks and
+		// tolerating a reconcile that re-stamps the ownerReference.
+		Eventually(func(g Gomega) {
+			operand := &appsv1.Deployment{}
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: operandNamespace,
+				Name:      operandDeployment,
+			}, operand)).To(Succeed())
+			g.Expect(operand.OwnerReferences).To(ContainElement(SatisfyAll(
+				HaveField("Kind", "MCPLifecycleOperator"),
+				HaveField("UID", cr.UID),
+				HaveField("Controller", HaveValue(BeTrue())),
+			)))
+		}, timeout, interval).Should(Succeed())
+
 		By("Deleting the MCPLifecycleOperator CR")
-		cr := &v1alpha1.MCPLifecycleOperator{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: v1alpha1.MCPLifecycleOperatorInstanceName,
-			},
-		}
 		Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
 
 		By("Waiting for the CR to be gone")
@@ -200,6 +220,16 @@ var _ = Describe("MCPLifecycleOperator", func() {
 			err := k8sClient.Get(ctx, types.NamespacedName{
 				Name: v1alpha1.MCPLifecycleOperatorInstanceName,
 			}, &v1alpha1.MCPLifecycleOperator{})
+			g.Expect(k8serr.IsNotFound(err)).To(BeTrue())
+		}, timeout, interval).Should(Succeed())
+
+		By("Verifying the operand deployment is garbage-collected via its ownerReference")
+		// Owner GC runs asynchronously in kube-controller-manager, so poll.
+		Eventually(func(g Gomega) {
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: operandNamespace,
+				Name:      operandDeployment,
+			}, &appsv1.Deployment{})
 			g.Expect(k8serr.IsNotFound(err)).To(BeTrue())
 		}, timeout, interval).Should(Succeed())
 
