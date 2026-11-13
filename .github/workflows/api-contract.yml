@@ -1,0 +1,36 @@
+name: API contract checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Baseline: head of rhoai-3.6, the newest GA release branch. No GA tags exist in
+  # this repository, and rhoai-3.7-ea.1 is a pre-release (EA) branch, so it is ignored.
+  # SHA verified 2026-11-13 via `git ls-remote opendatahub refs/heads/rhoai-3.6`.
+  # Moving this baseline forward requires approval from someone other than the author
+  # (RHOAIENG-103166).
+  crd-compat:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-crd-check.yml@latest
+    with:
+      crd-glob: config/crd/bases/*.yaml
+      baseline-refs: eb7f176adc7e74eeec1ba6ae7110d80885441c1e
+      mode: enforce
+
+  coverage:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-coverage-check.yml@latest
+    with:
+      crd-globs: config/crd/bases/*.yaml
+      # Excluded CRDs, with reasons:
+      #  - config/manifests/mcp-lifecycle-operator/crd/bases/*.yaml: CRDs of another
+      #    project (group mcp.x-k8s.io), bundled here only for deployment.
+      #  - internal/controller/resources/*.yaml: generated OLM/install bundle.
+      crd-exclude-globs: >-
+        config/manifests/mcp-lifecycle-operator/crd/bases/*.yaml
+        internal/controller/resources/*.yaml
+      baseline-refs: eb7f176adc7e74eeec1ba6ae7110d80885441c1e
+      yq-version: "4.45.1"
+      mode: enforce
